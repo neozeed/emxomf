@@ -22,12 +22,14 @@ Boston, MA 02111-1307, USA.  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <io.h>
 #include <stdarg.h>
 #include <string.h>
-#include <alloca.h>
+//#include <alloca.h>
+#include <errno.h>
 #include <ctype.h>
 #include <getopt.h>
-#include <alloca.h>
+//#include <alloca.h>
 #include <sys/param.h>
 #include <sys/emxload.h>
 #include <sys/types.h>
@@ -35,6 +37,7 @@ Boston, MA 02111-1307, USA.  */
 #include <sys/time.h>
 #include <ar.h>
 #include <assert.h>
+#include <stdint.h>
 
 /* Insert private header files. */
 
@@ -45,7 +48,410 @@ Boston, MA 02111-1307, USA.  */
 
 /* This header must come after defs.h */
 
-#include <sys/omflib.h>         /* Handling OMF libraries */
+#include "sys/omflib.h"         /* Handling OMF libraries */
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+//not sure where how
+#define VERSION         "0.9d"
+#define INNOTEK_VERSION         "0.9d"
+//#define _strncpy strncpy
+
+#define __KLIBC_ARG_SIGNATURE   "\177kLIBC\177"
+#define __KLIBC_ARG_NONZERO     0x80
+#define __KLIBC_ARG_MASK        0x3f
+#define __KLIBC_ARG_DQUOTE      0x01
+#define __KLIBC_ARG_RESPONSE    0x02
+#define __KLIBC_ARG_WILDCARD    0x04
+#define __KLIBC_ARG_ENV         0x08
+#define __KLIBC_ARG_SHELL       0x10
+#define __KLIBC_ARG_ARGV        0x20
+
+//strncpy
+char *_strncpy (char *string1, const char *string2, size_t count)
+{
+  char *dst;
+
+  dst = string1;
+  while (count > 0 && *string2 != 0)
+    {
+      *dst++ = *string2++;
+      --count;
+    }
+  while (count > 0)
+    {
+      *dst++ = 0;
+      --count;
+    }
+  return string1;
+}
+
+//defext
+void _defext (char *dst, const char *ext)
+{
+  int dot, sep, mbcl;
+
+  dot = FALSE; sep = TRUE;
+  while (*dst != 0)
+#if 0
+    if (CHK_MBCS_PREFIX (&__libc_GLocaleCtype, *dst, mbcl))
+      {
+        if (dst[1] == 0)        /* Invalid DBCS character */
+          return;
+        dst += mbcl;
+        sep = FALSE;
+      }
+#else
+if (1==2){}
+#endif
+    else
+      switch (*dst++)
+        {
+        case '.':
+          dot = TRUE;
+          sep = FALSE;
+          break;
+        case ':':
+        case '/':
+        case '\\':
+          dot = FALSE;
+          sep = TRUE;
+          break;
+        default:
+          sep = FALSE;
+          break;
+        }
+  if (!dot && !sep)
+    {
+      *dst++ = '.';
+      strcpy (dst, ext);
+    }
+}
+
+//response
+#define RPUT(x) do \
+  { \
+    if (new_argc >= new_alloc) \
+      { \
+        new_alloc += 20; \
+        new_argv = (char **)realloc (new_argv, new_alloc * sizeof (char *)); \
+        if (new_argv == NULL) \
+          goto out_of_memory; \
+      } \
+    new_argv[new_argc++] = x; \
+  } while (0)
+
+
+void _response (int *argcp, char ***argvp)
+{
+  int i, old_argc, new_argc, new_alloc;
+  char **old_argv, **new_argv;
+  char line[1+8192], *p;
+  FILE *f;
+
+  old_argc = *argcp; old_argv = *argvp;
+  for (i = 1; i < old_argc; ++i)
+    if (old_argv[i] != NULL
+        && !(old_argv[i][-1] & (__KLIBC_ARG_DQUOTE | __KLIBC_ARG_WILDCARD | __KLIBC_ARG_SHELL))
+        && old_argv[i][0] == '@')
+      break;
+  if (i >= old_argc)
+    return;                     /* do nothing */
+  new_argv = NULL; new_alloc = 0; new_argc = 0;
+  for (i = 0; i < old_argc; ++i)
+    {
+      if (i == 0 || old_argv[i] == NULL
+          || (old_argv[i][-1] & (__KLIBC_ARG_DQUOTE | __KLIBC_ARG_WILDCARD | __KLIBC_ARG_SHELL))
+          || old_argv[i][0] != '@'
+          || (f = fopen (old_argv[i]+1, "rt")) == NULL)
+        RPUT (old_argv[i]);
+      else
+        {
+          line[0] = __KLIBC_ARG_NONZERO | __KLIBC_ARG_RESPONSE;
+          while (fgets (line+1, sizeof (line)-1, f) != NULL)
+            {
+              p = strchr (line+1, '\n');
+              if (p != NULL) *p = 0;
+              p = strdup (line);
+              if (p == NULL)
+                goto out_of_memory;
+              RPUT (p+1);
+            }
+          if (ferror (f))
+            {
+              fputs ("Cannot read response file\n", stderr);
+              exit (255);
+            }
+          fclose (f);
+        }
+    }
+  RPUT (NULL); --new_argc;
+  *argcp = new_argc; *argvp = new_argv;
+  return;
+
+out_of_memory:
+  fputs ("Out of memory while reading response file\n", stderr);
+  exit (255);
+}
+
+//splitarg
+#define WHITE(c) ((c) == ' ' || (c) == '\t' || (c) == '\n')
+
+char ** _splitargs (char *string, int *count)
+{
+  int argc, arga, src, dst, bs, quote;
+  char *q, **argv;
+
+  argv = NULL; argc = 0; arga = 0; dst = 0; src = 0;
+  while (WHITE (string[src]))
+    ++src;
+  do
+    {
+      if (argc >= arga)
+        {
+          arga += 16;
+          argv = realloc (argv, arga * sizeof (*argv));
+          if (argv == NULL)
+            {
+              errno = ENOMEM;
+              return NULL;
+            }
+        }
+      if (string[src] == 0)
+        q = NULL;
+      else
+        {
+          q = string+dst; bs = 0; quote = 0;
+          for (;;)
+            {
+              if (string[src] == '"')
+                {
+                  while (bs >= 2)
+                    {
+                      string[dst++] = '\\';
+                      bs -= 2;
+                    }
+                  if (bs & 1)
+                    string[dst++] = '"';
+                  else
+                    quote = !quote;
+                  bs = 0;
+                }
+              else if (string[src] == '\\')
+                ++bs;
+              else
+                {
+                  while (bs != 0)
+                    {
+                      string[dst++] = '\\';
+                      --bs;
+                    }
+                  if (string[src] == 0 || (WHITE (string[src]) && !quote))
+                    break;
+                  string[dst++] = string[src];
+                }
+              ++src;
+            }
+          while (WHITE (string[src]))
+            ++src;
+          string[dst++] = 0;
+        }
+      argv[argc++] = q;
+    } while (q != NULL);
+  if (count != NULL)
+    *count = argc - 1;
+  return argv;
+}
+
+//from misc
+void _remext (char *path)
+{
+  int dot, sep, mbcl;
+  char *dotp;
+
+  dot = FALSE; sep = TRUE; dotp = NULL;
+  while (*path != 0)
+#if 0
+    if (CHK_MBCS_PREFIX (&__libc_GLocaleCtype, *path, mbcl))
+      {
+        if (path[1] == 0)       /* Invalid DBCS character */
+          break;
+        path += mbcl;
+        sep = FALSE;
+      }
+#else
+if(1==2){}
+#endif
+    else
+      switch (*path++)
+        {
+        case '.':
+          /* Note that PATH has been incremented. */
+          dotp = (sep ? NULL : path - 1);
+          dot = TRUE;
+          sep = FALSE;
+          break;
+        case ':':
+        case '/':
+        case '\\':
+          dot = FALSE;
+          sep = TRUE;
+          break;
+        default:
+          sep = FALSE;
+          break;
+        }
+  if (dot && dotp != NULL)
+    *dotp = 0;
+}
+
+//getname
+char *_getname (const char *path)
+{
+  const char *p;
+  int mbcl;
+
+  p = path;
+  while (*path != 0)
+#if 0
+    if (CHK_MBCS_PREFIX (&__libc_GLocaleCtype, *path, mbcl))
+      {
+        if (path[1] == 0)       /* Invalid DBCS character */
+          break;
+        path += mbcl;
+      }
+#else
+if(1==2){}
+#endif
+    else
+      switch (*path++)
+        {
+        case ':':
+        case '/':
+        case '\\':
+          p = path;             /* Note that PATH has been incremented */
+          break;
+        }
+  return (char *)p;
+}
+
+//envargs
+#define _ARG_NONZERO  0x80          /* Always set, to avoid end of string   */
+#define _ARG_ENV      0x08          /* Argument from environment            */
+void _envargs (int *argcp, char ***argvp, const char *name)
+{
+  char *str, *p, **args, **argv, **new_argv;
+  int argc, i, n, len;
+
+  str = getenv (name);
+  if (str == NULL || *str == 0)
+    return;
+  str = strdup (str);
+  if (str == NULL)
+    return;
+  args = _splitargs (str, &n);
+  if (args == NULL || n == 0)
+    return;
+  argc = *argcp; argv = *argvp;
+  new_argv = malloc ((argc + n + 1) * sizeof (char *));
+  if (new_argv == NULL)
+    return;
+  new_argv[0] = argv[0];
+  for (i = 0; i < n; ++i)
+    {
+      len = strlen (args[i]);
+      p = malloc (len + 2);
+      if (p == NULL)
+        return;
+      p[0] = _ARG_NONZERO|_ARG_ENV;
+      memcpy (p + 1, args[i], len + 1);
+      new_argv[1+i] = p + 1;
+    }
+  for (i = 1; i < argc; ++i)
+    new_argv[n+i] = argv[i];
+  new_argv[n+argc] = NULL;
+  free (str);
+  free (args);
+  *argcp = argc + n;
+  *argvp = new_argv;
+}
+
+//wildcard
+
+#define WPUT(x) do { \
+    if (new_argc >= new_alloc) \
+      { \
+        new_alloc += 20; \
+        new_argv = (char **)realloc (new_argv, new_alloc * sizeof (char *)); \
+        if (new_argv == NULL) \
+            goto out_of_memory; \
+      } \
+    new_argv[new_argc++] = x; \
+  } while (0)
+
+void _wildcard (int *argcp, char ***argvp)
+{
+  int i, old_argc, new_argc, new_alloc;
+  char **old_argv, **new_argv;
+  char line[256], *p, *q;
+//  struct _find find;
+    struct _finddata_t find;
+  int x;
+
+
+  old_argc = *argcp; old_argv = *argvp;
+//  _rfnlwr ();
+  for (i = 1; i < old_argc; ++i)
+    if (old_argv[i] != NULL &&
+        !(old_argv[i][-1] & (__KLIBC_ARG_DQUOTE | __KLIBC_ARG_RESPONSE | __KLIBC_ARG_ARGV | __KLIBC_ARG_SHELL)) &&
+        strpbrk (old_argv[i], "?*") != NULL)
+      break;
+  if (i >= old_argc)
+    return;                 /* do nothing */
+  new_argv = NULL; new_alloc = 0; new_argc = 0;
+  for (i = 0; i < old_argc; ++i)
+    {
+#if 0
+      if (i == 0 || old_argv[i] == NULL
+          || (old_argv[i][-1] & (__KLIBC_ARG_DQUOTE | __KLIBC_ARG_RESPONSE | __KLIBC_ARG_ARGV | __KLIBC_ARG_SHELL))
+          || strpbrk (old_argv[i], "?*") == NULL
+          || _findfirst (old_argv[i], 0x10, &find) != 0)
+#else
+      x=_findfirst (old_argv[i], &find);
+      if (i == 0 || old_argv[i] == NULL || x)
+#endif
+        WPUT (old_argv[i]);
+      else
+        {
+          line[0] = __KLIBC_ARG_NONZERO | __KLIBC_ARG_WILDCARD;
+          strcpy (line+1, old_argv[i]);
+          p = _getname (line + 1);
+          do
+            {
+              if (   find.name[0] != '.'
+                  || (   find.name[1] != '\0'
+                      && (find.name[1] != '.' || find.name[2] != '\0')))
+                {
+                  strcpy (p, find.name);
+//                  _fnlwr2 (p, line+1);
+                  q = strdup (line);
+                  if (q == NULL)
+                    goto out_of_memory;
+                  WPUT (q+1);
+                }
+            } while (_findnext (x, &find) == 0);
+        }
+    }
+  WPUT (NULL); --new_argc;
+  *argcp = new_argc; *argvp = new_argv;
+//  _rfnlwr ();
+  return;
+
+out_of_memory:
+  fputs ("Out of memory while expanding wildcards\n", stderr);
+  exit (255);
+}
+/////////////////////////////////////////////////////////////////////////////////////////////
+
 
 /* Flag bits for FLAGS field of the struct symbol structure. */
 
@@ -159,13 +565,13 @@ long text_size = 0;
 /* The data_ptr variable points to the first byte of the data
    segment.  data_size bytes are available at data_ptr. */
 
-static byte *data_ptr;
-static long data_size;
+byte *data_ptr;
+long data_size;
 
 /* These varibles point to the text and data relocation tables. */
 
-static const struct relocation_info *text_rel;
-static const struct relocation_info *data_rel;
+const struct relocation_info *text_rel;
+const struct relocation_info *data_rel;
 
 /* Public variables for communication with stabshll.c. */
 
@@ -188,10 +594,10 @@ int hll_version = 4;
 /* Private variables. */
 
 /* The name of the current input file. */
-static const char *inp_fname;
+const char *inp_fname;
 
 /* The name of the current output file. */
-static const char *out_fname = NULL;
+const char *out_fname = NULL;
 
 /* Use this file name for reporting errors.  This is either the name
    of the input file or a library name plus module name:
@@ -199,210 +605,210 @@ static const char *out_fname = NULL;
 const char *error_fname;
 
 /* The output directory.  This is set by the -O option. */
-static const char *output_dir = "";
+const char *output_dir = "";
 
 /* The current input file. */
-static FILE *inp_file;
+FILE *inp_file;
 
 /* The current output file. */
-static FILE *out_file = NULL;
+FILE *out_file = NULL;
 
 /* While writing a LIB response file, this variable contains the
    stream pointer.  Otherwise, this variable is NULL. */
-static FILE *response_file = NULL;
+FILE *response_file = NULL;
 
 /* When creating an OMF library (.lib file), this variable contains
    the descriptor used by the omflib library.  Otherwise, this
    variable is NULL. */
-static struct omflib *out_lib = NULL;
+struct omflib *out_lib = NULL;
 
 /* This buffer receives error messages from the omflib library. */
-static char lib_errmsg[512];
+char lib_errmsg[512];
 
 /* emxomf reads a complete a.out module into memory.  inp_buf points
    to the buffer holding the current a.out module.  This pointer is
    aliased by sym_ptr etc. */
-static byte *inp_buf;
+byte *inp_buf;
 
 /* OMF records are constructed in this buffer.  The first three bytes
    are used for the record type and record length.  One byte at the
    end is used for the checksum. */
-static byte out_buf[1+2+MAX_REC_SIZE+1];
+byte out_buf[1+2+MAX_REC_SIZE+1];
 
 /* Index into out_buf (to be more precise: it's a pointer into
    out_data, which is an alias to out_buf+3) for the next byte of the
    OMF record. */
-static int out_idx;
+int out_idx;
 
 /* The list of OMF names.  lnames is the head of the list, lname_add
    is used to add another name to the end of the list. */
-static struct lname *lnames;
-static struct lname **lname_add;
+struct lname *lnames;
+struct lname **lname_add;
 
 /* The list of sets.  sets is the head of the list, set_add is used to
    add another set to the end of the list. */
-static struct set *sets;
-static struct set **set_add;
+struct set *sets;
+struct set **set_add;
 
 /* If this variable is TRUE, an a.out archive is split into several
    OMF .obj files (-x option).  If this variable is FALSE, an a.out
    archive is converted into an OMF library file. */
-static int opt_x = FALSE;
+int opt_x = FALSE;
 
 /* Remove underscores from all symbol names */
-static int opt_rmunder = FALSE;
+int opt_rmunder = FALSE;
 
 /* This is the page size for OMF libraries.  It is set by the -p
    option. */
-static int page_size = 0;
+int page_size = 0;
 
 /* The index of the next OMF name, used by find_lname().  Name indices
    are established by LNAMES records written by write_lnames(). */
-static int lname_index;
+int lname_index;
 
 /* The index of the next segment, used by seg_def() for creating
    SEGDEF records. */
-static int segdef_index;
+int segdef_index;
 
 /* The index of the next group, used for creating GRPDEF records. */
-static int group_index;
+int group_index;
 
 /* The index of the next symbol, used for creating EXTDEF and COMDEF
    records. */
-static int sym_index;
+int sym_index;
 
 /* The index of the "WEAK$ZERO" symbol or 0. */
-static int weak_zero_index;
+int weak_zero_index;
 
 /* OMF name indices: segments, classes, groups, etc. */
-static int ovl_name;            /* Overlay name, "" */
-static int text_seg_name;       /* Text segment, "TEXT32" */
-static int data_seg_name;       /* Data segment, "DATA32" */
-static int udat_seg_name;       /* Explicit data segment, see -D */
-static int stack_seg_name;      /* Stack segment, "STACK" */
-static int bss_seg_name;        /* Uninitialized data segment, "BSS32" */
-static int symbols_seg_name;    /* Symbols segment, "$$SYMBOLS" */
-static int types_seg_name;      /* Types segment */
-static int code_class_name;     /* Code class, "CODE" */
-static int data_class_name;     /* Data class, "DATA" */
-static int stack_class_name;    /* Stack class, "STACK" */
-static int bss_class_name;      /* Uninitialized data class, "BSS" */
-static int debsym_class_name;   /* Symbols class, "DEBSYM" */
-static int debtyp_class_name;   /* Types class, "DEBTYP" */
-static int flat_group_name;     /* FLAT group, "FLAT" */
-static int dgroup_group_name;   /* DGROUP group, "DGROUP" or "DATAGROUP" */
+int ovl_name;            /* Overlay name, "" */
+int text_seg_name;       /* Text segment, "TEXT32" */
+int data_seg_name;       /* Data segment, "DATA32" */
+int udat_seg_name;       /* Explicit data segment, see -D */
+int stack_seg_name;      /* Stack segment, "STACK" */
+int bss_seg_name;        /* Uninitialized data segment, "BSS32" */
+int symbols_seg_name;    /* Symbols segment, "$$SYMBOLS" */
+int types_seg_name;      /* Types segment */
+int code_class_name;     /* Code class, "CODE" */
+int data_class_name;     /* Data class, "DATA" */
+int stack_class_name;    /* Stack class, "STACK" */
+int bss_class_name;      /* Uninitialized data class, "BSS" */
+int debsym_class_name;   /* Symbols class, "DEBSYM" */
+int debtyp_class_name;   /* Types class, "DEBTYP" */
+int flat_group_name;     /* FLAT group, "FLAT" */
+int dgroup_group_name;   /* DGROUP group, "DGROUP" or "DATAGROUP" */
 
 /* Segment indices for the TEXT32, DATA32, STACK, BSS32, $$SYMBOLS,
    $$TYPES and explicit data segments. */
-static int text_index;          /* Text segment, TEXT32 */
-static int data_index;          /* Data segment, DATA32 */
-static int udat_index;          /* Data segment set by -D or same as above */
-static int stack_index;         /* Stack segment, STACK */
-static int bss_index;           /* Uninitialized data segment, BSS32 */
-static int symbols_index;       /* Symbols segment, $$SYMBOLS */
-static int types_index;         /* Types segment, $$TYPES */
+int text_index;          /* Text segment, TEXT32 */
+int data_index;          /* Data segment, DATA32 */
+int udat_index;          /* Data segment set by -D or same as above */
+int stack_index;         /* Stack segment, STACK */
+int bss_index;           /* Uninitialized data segment, BSS32 */
+int symbols_index;       /* Symbols segment, $$SYMBOLS */
+int types_index;         /* Types segment, $$TYPES */
 
 /* Group indices for the FLAT and DGROUP groups. */
-static int flat_index;          /* FLAT group */
-static int dgroup_index;        /* DGROUP group */
+int flat_index;          /* FLAT group */
+int dgroup_index;        /* DGROUP group */
 
 /* Next FIXUPP thread index to be used for the frame and target
    thread, respectively. */
-static int frame_thread_index;  /* Frame thread */
-static int target_thread_index; /* Target thread */
+int frame_thread_index;  /* Frame thread */
+int target_thread_index; /* Target thread */
 
 /* We define target threads for referencing the TEXT32, DATA32 (or the
    one set by -D) and BSS32 segments and the FLAT group in FIXUPP
    records.  A thread has not been defined if the variable is -1.
    Otherwise, the value is the thread number. */
-static int text_thread;         /* TEXT32 segment */
-static int data_thread;         /* Data segment (DATA32 or -D) */
-static int bss_thread;          /* BSS32 segment */
-static int flat_thread;         /* FLAT group */
+int text_thread;         /* TEXT32 segment */
+int data_thread;         /* Data segment (DATA32 or -D) */
+int bss_thread;          /* BSS32 segment */
+int flat_thread;         /* FLAT group */
 
 /* This variable holds the module name.  See get_mod_name(). */
-static char mod_name[256];
+char mod_name[256];
 
 /* This variable holds the base(=current) directory.  See get_mod_name(). */
-static char base_dir[256];
+char base_dir[256];
 
 /* This variable holds the timestamped weak marker for the current module. */
-static char weak_marker[SYMBOL_WEAK_LENGTH + 1];
+char weak_marker[SYMBOL_WEAK_LENGTH + 1];
 
 /* This growing array holds the file name table for generating line
    number information.  */
-static char **file_list;
-static struct grow file_grow;
+char **file_list;
+struct grow file_grow;
 
 /* This variable points to the a.out header of the input module. */
-static const struct exec *a_out_h;
+const struct exec *a_out_h;
 
 /* This table contains additional information for the a.out symbols.
    Each entry of the sym_ptr table is complemented by an entry of this
    table. */
-static struct symbol *sym_more;
+struct symbol *sym_more;
 
 /* The length of the a.out string table, in bytes.  This value
    includes the 32-bit number at the start of the string table. */
-static long str_size;
+long str_size;
 
 /* omflib_write_module() stored the page number of the module to this
    variable. */
-static word mod_page;
+word mod_page;
 
 /* This variable is TRUE until we have written the first line to the
    LIB response file.  It is used to suppress the line continuation
    character `&'. */
-static int response_first = TRUE;
+int response_first = TRUE;
 
 /* This is the list of files to be deleted on program termination.
    See delete_files(). */
-static struct delete *files_to_delete = NULL;
+struct delete *files_to_delete = NULL;
 
 /* The module type (-l and -m options).  It is MT_MODULE unless the -l
    or -m option is used. */
-static enum {MT_MODULE, MT_MAIN, MT_LIB} mod_type = MT_MODULE;
+enum {MT_MODULE, MT_MAIN, MT_LIB} mod_type = MT_MODULE;
 
 /* The start (entry point) symbol (-m option).  This is NULL unless
    the -m option (or -l with argument) is used. */
-static char *entry_name = NULL;
+char *entry_name = NULL;
 
 /* The name of the identifier manipulation DLL.  If this variable is
    NULL, no IDMDLL record is written. */
-static char *idmdll_name = "INNIDM";
+char *idmdll_name = "INNIDM";
 
 /* the name of the debug packing DLL. This variable is not used when
    debug info is stripped. If NULL we'll select the default for the
    linker type (EMXOMFLD_TYPE). */
-static char *dbgpack_name = NULL;
+char *dbgpack_name = NULL;
 
 /* If this variable is TRUE (-b option), we always use the 32-bit
    variant of the OMF records.  If this variable is FALSE, we use the
    16-bit variant whenever possible.  This non-documented feature is
    used for debugging. */
-static int force_big = FALSE;
+int force_big = FALSE;
 
 /* The name of the LIB response file (-r and -R options).  This value
    is NULL unless the -r or -R option is used. */
-static char *response_fname = NULL;
+char *response_fname = NULL;
 
 /* When creating a LIB response file, emit commands for replacing
    modules if this variable is TRUE (-R option).  Otherwise, emit
    commands for adding modules (-r option). */
-static int response_replace;
+int response_replace;
 
 /* Delete input files after successful conversion if this variable is
    TRUE (-d option). */
-static int delete_input_files = FALSE;
+int delete_input_files = FALSE;
 
 /* Strip debug information if this variable is TRUE (-s option).
    Otherwise, convert DBX debugging information to HLL debugging
    information. */
-static int strip_symbols = FALSE;
+int strip_symbols = FALSE;
 
 /* Print unknown symbol table entries if this variable is TRUE (-u
    option). */
-static int unknown_stabs = FALSE;
+int unknown_stabs = FALSE;
 
 /* Warning level (-q & -v options). */
 int warning_level = 1;
@@ -411,14 +817,14 @@ int warning_level = 1;
    of default libraries.  The -i option is used to add a default
    library request.  The libreq_add pointer is used for appending new
    elements to the tail of the list. */
-static struct libreq *libreq_head = NULL;
-static struct libreq **libreq_add = &libreq_head;
+struct libreq *libreq_head = NULL;
+struct libreq **libreq_add = &libreq_head;
 
 /* fetch_mod_str() caches the string it has retrieved from other
    modules of the same library.  modstr_cache points to the head of
    the linked list of `struct modstr' structures. */
 
-static struct modstr *modstr_cache = NULL;
+struct modstr *modstr_cache = NULL;
 
 /* Simulate the data array of an OMF record.  The data is stored along
    with the record type (1 byte) and record length (2 bytes) in a
@@ -429,14 +835,14 @@ static struct modstr *modstr_cache = NULL;
    non-NULL, put variables into the named data segment, which isn't a
    member of DGROUP. */
 
-static char *udat_seg_string = NULL;
+char *udat_seg_string = NULL;
 
 /* Prototypes for private functions. */
 
-static void doesn_fit (void) NORETURN2;
-static void usage (void) NORETURN2;
-static int ar_read_header (struct ar_hdr *dst, long pos);
-static long ar_member_size (const struct ar_hdr *p);
+void doesn_fit (void) NORETURN2;
+void usage (void) NORETURN2;
+int ar_read_header (struct ar_hdr *dst, long pos);
+long ar_member_size (const struct ar_hdr *p);
 
 
 /* Display an error message on stderr, delete the output file and
@@ -598,7 +1004,7 @@ void set_hll_type (int index, int hll_type)
      isn't prefect as heap can be reused, but it'll have to do). */
   if (hll_type < 0 || hll_type > 0x7fff)
     {
-      static const char *s_pszComplainedFor = NULL;
+      const char *s_pszComplainedFor = NULL;
       if (s_pszComplainedFor != error_fname)
         {
           s_pszComplainedFor = error_fname;
@@ -615,7 +1021,7 @@ void set_hll_type (int index, int hll_type)
 
 /* Initialize variables for starting a new OMF output file. */
 
-static void init_obj (void)
+void init_obj (void)
 {
   /* Initialize the list of OMF-style names. */
 
@@ -653,7 +1059,7 @@ static void init_obj (void)
    records.  Note: INDEX must be assigned sequentially, append to end
    of list!  Otherwise, write_lnames() would have to sort the list */
 
-static int find_lname (const char *name)
+int find_lname (const char *name)
 {
   struct lname *p;
 
@@ -686,7 +1092,7 @@ static int find_lname (const char *name)
 
 /* Deallocate the memory used by the list of OMF-style names. */
 
-static void free_lnames (void)
+void free_lnames (void)
 {
   struct lname *p, *q;
 
@@ -701,7 +1107,7 @@ static void free_lnames (void)
 
 /* Start a new OMF record.  TYPE is the record type. */
 
-static void init_rec (int type)
+void init_rec (int type)
 {
   out_buf[0] = (byte)type;
   out_idx = 0;
@@ -728,7 +1134,7 @@ static void init_rec (int type)
    simple instance of the loop we use for packing multiple definitions
    into OMF records. */
 
-static void write_rec (void)
+void write_rec (void)
 {
   byte chksum;
   int i;
@@ -774,7 +1180,7 @@ static void write_rec (void)
    This cannot happen unless there is a bug in this program.  Display
    an error message and quit. */
 
-static void doesn_fit (void)
+void doesn_fit (void)
 {
   error ("Record too long");
 }
@@ -782,7 +1188,7 @@ static void doesn_fit (void)
 
 /* Calculates the hash for a string using the original djb2 aglorithm. */
   
-static unsigned hash_string(const char *pch, size_t cch)
+unsigned hash_string(const char *pch, size_t cch)
 {
     unsigned uHash;
     for (uHash = 5381; cch > 0; pch++, cch--)
@@ -795,10 +1201,10 @@ static unsigned hash_string(const char *pch, size_t cch)
    linker should accept. The width is fixed, and the string is clipped 
    or padded with zeros to satisfy that. The return value is psz + cchWidth. */
 
-static char *format_u64(uint64_t u64, char *psz, unsigned uRadix, int cchWidth)
+char *format_u64(uint64_t u64, char *psz, unsigned uRadix, int cchWidth)
 {
-    static const char       s_achDigits[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    static const unsigned   s_cchDigits = sizeof(s_achDigits) / sizeof(s_achDigits[0]) - 1;
+    const char       s_achDigits[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const unsigned   s_cchDigits = sizeof(s_achDigits) / sizeof(s_achDigits[0]) - 1;
     assert(uRadix <= s_cchDigits);
     while (cchWidth-- > 0)
     {
@@ -817,7 +1223,7 @@ static char *format_u64(uint64_t u64, char *psz, unsigned uRadix, int cchWidth)
    The string returned in pOutBuf is zero-terminated. The function returns the
    length of the resulting string. */
 
-static int make_nstr (const char *pszName, size_t cch, char *pszOutBuf)
+int make_nstr (const char *pszName, size_t cch, char *pszOutBuf)
 {
     if (    cch > SYMBOL_MAX_LENGTH
         &&  !strstr(pszName + SYMBOL_MAX_LENGTH - SYMBOL_WEAK_LENGTH, "!_")
@@ -860,7 +1266,7 @@ static int make_nstr (const char *pszName, size_t cch, char *pszOutBuf)
    space left in the OMF record; if there isn't, display an error
    message and abort. */
 
-static void put_nstr(const char *pszName, size_t cch)
+void put_nstr(const char *pszName, size_t cch)
 {
     char szName[256];
 
@@ -893,7 +1299,7 @@ static inline void put_str(const char *pszName)
    record.  If these conditions are not met, display an error message
    and quit. */
 
-static void put_sym (const char *src)
+void put_sym (const char *src)
 {
   if (strip_underscore (src))
     ++src;
@@ -909,7 +1315,7 @@ static void put_sym (const char *src)
    OMF record.  If there is not enough space left in the OMF record,
    display an error message and quit. */
 
-static void put_16 (int x)
+void put_16 (int x)
 {
   if (!fits (2))
     doesn_fit ();
@@ -922,7 +1328,7 @@ static void put_16 (int x)
    OMF record.  If there is not enough space left in the OMF record,
    display an error message and quit. */
 
-static void put_24 (long x)
+void put_24 (long x)
 {
   if (!fits (3))
     doesn_fit ();
@@ -936,7 +1342,7 @@ static void put_24 (long x)
    OMF record.  If there is not enough space left in the OMF record,
    display an error message and quit. */
 
-static void put_32 (long x)
+void put_32 (long x)
 {
   if (!fits (4))
     doesn_fit ();
@@ -956,7 +1362,7 @@ static void put_32 (long x)
    comes next.  If there is not enough space left in the OMF record or
    if the value exceeds 32767, display an error message and quit. */
 
-static void put_idx (int x)
+void put_idx (int x)
 {
   if (x <= 0x7f)
     {
@@ -980,7 +1386,7 @@ static void put_idx (int x)
    not enough space left in the OMF record, display an error message
    and quit. */
 
-static void put_mem (const void *src, int size)
+void put_mem (const void *src, int size)
 {
   if (!fits (size))
     doesn_fit ();
@@ -1000,7 +1406,7 @@ static void put_mem (const void *src, int size)
 
    Name indices are assigned sequentially. */
 
-static void write_lnames (void)
+void write_lnames (void)
 {
   const struct lname *p;
   int started;
@@ -1028,7 +1434,7 @@ static void write_lnames (void)
 /* Add a string to the current EXTDEF record or start a new EXTDEF
    record.  PSTARTED points to an object keeping state. */
 
-static void add_extdef (int *pstarted, const char *name, int type)
+void add_extdef (int *pstarted, const char *name, int type)
 {
   if (*pstarted)
     {
@@ -1064,7 +1470,7 @@ static void add_extdef (int *pstarted, const char *name, int type)
 
    Symbol indices are assigned sequentially.  */
 
-static void write_extdef (void)
+void write_extdef (void)
 {
   const char *name;
   int i, started;
@@ -1116,7 +1522,7 @@ static void write_extdef (void)
 
    */
 
-static void write_wkext (void)
+void write_wkext (void)
 {
   int i;
 
@@ -1150,7 +1556,7 @@ static void write_wkext (void)
  *                      This must be at least 256, the code make this assumption!
  * @remark I'm sorry this function is written in my coding style - not!
  */
-static const char *weak_process_name(const struct nlist *pSym, const char *pszOrgName, char *pachName, int cchName)
+const char *weak_process_name(const struct nlist *pSym, const char *pszOrgName, char *pachName, int cchName)
 {
     switch (pSym->n_type)
     {
@@ -1223,7 +1629,7 @@ static const char *weak_process_name(const struct nlist *pSym, const char *pszOr
 
 /* Write ALIAS records into the output file for all indirect references. */
 
-static void write_alias (void)
+void write_alias (void)
 {
   int i;
   const char *pub_name;
@@ -1274,7 +1680,7 @@ static void write_alias (void)
    The base frame field is present only if the base segment field is
    0. */
 
-static void write_pubdef1 (int type, int index, int big, dword start)
+void write_pubdef1 (int type, int index, int big, dword start)
 {
   int i, started;
   const char *name, *pub_name;
@@ -1347,7 +1753,7 @@ static void write_pubdef1 (int type, int index, int big, dword start)
 
 /* Write main alias if _main is a pubdef.
    The debugger looks for 'main' not '_main' in the symbol table. */
-static void write_pubdef_main ()
+void write_pubdef_main ()
 {
     int i;
 
@@ -1390,7 +1796,7 @@ static void write_pubdef_main ()
    and N_DATA symbols stored in the sym_ptr array.  Common symbols are
    handled by write_comdef() below. */
 
-static void write_pubdef (void)
+void write_pubdef (void)
 {
   write_pubdef1 (N_ABS,   0,          FALSE, 0);
   write_pubdef1 (N_ABS,   0,          TRUE, 0);
@@ -1435,7 +1841,7 @@ static void write_pubdef (void)
    0 through 0xffffff   0x84, followed by 24-bit word
    0 through 0xffffffff 0x88, followed by 32-bit word */
 
-static void write_comdef (void)
+void write_comdef (void)
 {
   int i, started;
   long size;
@@ -1513,7 +1919,7 @@ static void write_comdef (void)
     B (bit 1)           Big (segment length is 64KB)
     P (bit 0)           USE32 */
 
-static int seg_def (int name_index, int class_index, long size, int stack, int is_set)
+int seg_def (int name_index, int class_index, long size, int stack, int is_set)
 {
   byte seg_attr;
 
@@ -1548,7 +1954,7 @@ static int seg_def (int name_index, int class_index, long size, int stack, int i
    X1 and X2 point to reloc structures.  We compare the ADDRESS fields
    of the structures. */
 
-static int reloc_compare (const void *x1, const void *x2)
+int reloc_compare (const void *x1, const void *x2)
 {
   dword a1, a2;
 
@@ -1629,7 +2035,7 @@ static int reloc_compare (const void *x1, const void *x2)
     P (bit 2)           Bit 2 of target method
     Targt (bits 0-1)    target thread number (T=1) or target method (T=0)  */
 
-static void write_seg (int index, int seg_name, byte *src, long seg_size,
+void write_seg (int index, int seg_name, byte *src, long seg_size,
                        const struct relocation_info *rel, long rel_size, int sst_flag,
                        const int *boundary, int boundary_count, int seg_type)
 {
@@ -1979,7 +2385,7 @@ static void write_seg (int index, int seg_name, byte *src, long seg_size,
    stored without leading byte count, the linker gets the length of
    the name from the record length. */
 
-static void request_lib (const char *name)
+void request_lib (const char *name)
 {
   init_rec (COMENT);
   put_8 (0x40);
@@ -1993,7 +2399,7 @@ static void request_lib (const char *name)
    library names are stored in a list.  libreq_head points to the head
    of the list. */
 
-static void write_libs (void)
+void write_libs (void)
 {
   struct libreq *p;
 
@@ -2006,7 +2412,7 @@ static void write_libs (void)
    output file.  The style we use is called HLL version 3.  Create a
    COMENT record of class 0xa1. */
 
-static void write_debug_style (void)
+void write_debug_style (void)
 {
   if (strip_symbols || !a_out_h->a_syms)
     return;
@@ -2028,7 +2434,7 @@ static void write_debug_style (void)
    PUBDEF, SEGDEF, TYPDEF, and most of the COMENT classes.  Create a
    COMENT record of class 0xa2. */
 
-static void write_pass2 (void)
+void write_pass2 (void)
 {
   init_rec (COMENT);
   put_8 (0x40);
@@ -2041,7 +2447,7 @@ static void write_pass2 (void)
 /* Create segment names for all the sets.  It is here where sets are
    created.  See write_set_data() for details. */
 
-static void define_set_names (void)
+void define_set_names (void)
 {
   int i, j;
   struct set *set_ptr;
@@ -2127,7 +2533,7 @@ static void define_set_names (void)
 /* Define three segments for each set.  The segment names have already
    been defined, now write the SEGDEF records. */
 
-static void write_set_segs (void)
+void write_set_segs (void)
 {
   int j;
   struct set *set_ptr;
@@ -2143,7 +2549,7 @@ static void write_set_segs (void)
 /* Write the PUBDEF records for all the sets.  One PUBDEF record is
    generated for each set, it defines the set name. */
 
-static void write_set_pub (void)
+void write_set_pub (void)
 {
   struct set *set_ptr;
 
@@ -2183,7 +2589,7 @@ static void write_set_pub (void)
    defined which points to the start of SET1XXX.  See
    /emx/lib/gcc/main.c for code which uses sets. */
 
-static void write_set_data (void)
+void write_set_data (void)
 {
   struct set *set_ptr;
   dword x;
@@ -2263,7 +2669,7 @@ static void write_set_data (void)
 
 /* Find a relocation table entry by fixup address. */
 
-static const struct relocation_info *find_reloc_fixup (const struct relocation_info *rel,
+const struct relocation_info *find_reloc_fixup (const struct relocation_info *rel,
                                              long rel_size, dword addr)
 {
   int i, count;
@@ -2276,7 +2682,7 @@ static const struct relocation_info *find_reloc_fixup (const struct relocation_i
 }
 
 
-static void free_modstr_cache (void)
+void free_modstr_cache (void)
 {
   struct modstr *p1, *p2;
 
@@ -2296,7 +2702,7 @@ static void free_modstr_cache (void)
    the string to DST, a buffer of DST_SIZE bytes.  Return TRUE if
    successful, FALSE on failure. */
 
-static int fetch_modstr (const struct relocation_info *rel, dword addr,
+int fetch_modstr (const struct relocation_info *rel, dword addr,
                          char *dst, size_t dst_size)
 {
   const byte *seg_ptr;
@@ -2446,7 +2852,7 @@ static int fetch_modstr (const struct relocation_info *rel, dword addr,
 
 /* Create an import record and a PUBDEF record. */
 
-static void make_import (const char *pub_name, const char *proc_name,
+void make_import (const char *pub_name, const char *proc_name,
                          long ord, const char *mod)
 {
   char szPubName[256];
@@ -2491,7 +2897,7 @@ static void make_import (const char *pub_name, const char *proc_name,
    emximp), create an OMF-style import module and return TRUE.
    Otherwise, return FALSE. */
 
-static int handle_import_i2 (void)
+int handle_import_i2 (void)
 {
   int i, len1, mod_len;
   long ord;
@@ -2563,7 +2969,7 @@ static int handle_import_i2 (void)
 }
 
 /* Convert import entries. */
-static void write_import_i2 (void)
+void write_import_i2 (void)
 {
   int i;
   const char *name1, *name2;
@@ -2655,7 +3061,7 @@ static void write_import_i2 (void)
    emximp), create an OMF-style import module and return TRUE.
    Otherwise, return FALSE. */
 
-static int handle_import_i1 (void)
+int handle_import_i1 (void)
 {
   int i;
   const char *pub_name;
@@ -2739,7 +3145,7 @@ static int handle_import_i1 (void)
 /**
  * Emits a OMF export record if the symbols is defined in this module.
  */
-static void make_export(const char *pszSymbol, size_t cchSymbol,
+void make_export(const char *pszSymbol, size_t cchSymbol,
                         const char *pszExpName, size_t cchExpName, unsigned iOrdinal)
 {
     const struct nlist *pSym;
@@ -2781,7 +3187,7 @@ static void make_export(const char *pszSymbol, size_t cchSymbol,
    any special ordinal number.
 
    Export entries for symbols which are not defined in the object are ignored. */
-static void write_export (void)
+void write_export (void)
 {
     int i;
 
@@ -2848,7 +3254,7 @@ static void write_export (void)
    to be done is replacing slashes with backslashes as IPMD doesn't
    like slashes in file names.  The conversion is done in place. */
 
-static void convert_filename (char *name)
+void convert_filename (char *name)
 {
   while (*name != 0)
     {
@@ -2862,7 +3268,7 @@ static void convert_filename (char *name)
 /* Converts dashed filenames to somewhat absolute ones assuming that
    the current directory is what they're relative to. */
 
-static int abspath_filename(char *dst, const char *src, int size)
+int abspath_filename(char *dst, const char *src, int size)
 {
   int   rc = -1;
   char *psz;
@@ -2893,7 +3299,7 @@ static int abspath_filename(char *dst, const char *src, int size)
 
    If there is no such symbol, use the output file name. */
 
-static void get_mod_name (void)
+void get_mod_name (void)
 {
   int i, len, ok;
   const char *p1, *p2;
@@ -2966,7 +3372,7 @@ static void get_mod_name (void)
    file, this function does nothing.  Otherwise, the module name is
    expected in the mod_name variable. */
 
-static void write_theadr (void)
+void write_theadr (void)
 {
   if (out_lib == NULL)
     {
@@ -2983,7 +3389,7 @@ static void write_theadr (void)
    also be suppressed if the program hasn't been compiled by the GNU
    C++ compiler. */
 
-static void write_idmdll ()
+void write_idmdll ()
 {
   /* kso #465 2003-06-04: This test doesn't work any longer, sorry.
    *                      Pretend everything is C++ */
@@ -3005,7 +3411,7 @@ static void write_idmdll ()
 
 /* Tell ilink which TIS (Tools I Standard) version we follow.
    (At least that's what I think this comment record is good for). */
-static void write_tis ()
+void write_tis ()
 {
   unsigned short ver = 0;
   char *type = getenv ("EMXOMFLD_TYPE");
@@ -3029,7 +3435,7 @@ static void write_tis ()
 
 /* Tell ilink which dll to use when /DBGPACK is specificed. The dllname
    is given without extension. */
-static void write_dbgpack ()
+void write_dbgpack ()
 {
   const char *name = dbgpack_name;
   if (strip_symbols || !a_out_h->a_syms)
@@ -3058,7 +3464,7 @@ static void write_dbgpack ()
 
 /* Find a file name for creating line number information. */
 
-static int file_find (const char *name)
+int file_find (const char *name)
 {
   int i;
   char *psz;
@@ -3102,7 +3508,7 @@ static int file_find (const char *name)
    and X2 point to struct line structures.  Line number entries are
    sorted by address, file and line number. */
 
-static int line_compare (const void *x1, const void *x2)
+int line_compare (const void *x1, const void *x2)
 {
   dword a1, a2;
   int i1, i2;
@@ -3131,7 +3537,7 @@ static int line_compare (const void *x1, const void *x2)
 /* Write linenumber fixups for HLL v4 records
  * We need fixups for segment idx and offset in the special
  * first entry. */
-static void write_linenumfixup(void)
+void write_linenumfixup(void)
 {
   /* ASSUME! flat_thread is defined. */
   /* ASSUME! base seg idx of linnum rec < 128. */
@@ -3161,7 +3567,7 @@ static void write_linenumfixup(void)
    the line number information format currently used by IPMD is not
    documented.  This code is based on experimentation. */
 
-static void write_linnum (void)
+void write_linnum (void)
 {
   int i, started, len, file_index;
   int valid_lines;
@@ -3412,7 +3818,7 @@ static void write_linnum (void)
 
 /* Print unknown symbol table entries (-u option). */
 
-static void list_unknown_stabs (void)
+void list_unknown_stabs (void)
 {
   int i;
 
@@ -3459,7 +3865,7 @@ static void list_unknown_stabs (void)
 /* Convert an a.out module to an OMF module.  SIZE is the number of
    bytes in the input file inp_file. */
 
-static void o_to_omf (long size)
+void o_to_omf (long size)
 {
   byte *t;
   const struct nlist *entry_symbol;
@@ -3733,7 +4139,7 @@ invalid:
 
 /* Display some hints on using this program, then quit. */
 
-static void usage (void)
+void usage (void)
 {
   puts ("emxomf " VERSION INNOTEK_VERSION " -- Copyright (c) 1992-1995 by Eberhard Mattes\n");
   puts ("Usage:");
@@ -3768,7 +4174,7 @@ static void usage (void)
 /* Create the output file.  If the -r or -R option is used, create the
    LIB resonse file. */
 
-static void open_output (void)
+void open_output (void)
 {
   char *tmp, *p;
 
@@ -3794,7 +4200,7 @@ static void open_output (void)
 /* Close the output file.  Display an error message and quit on
    failure. */
 
-static void close_output (void)
+void close_output (void)
 {
   if (fflush (out_file) != 0 || fclose (out_file) != 0)
     {
@@ -3811,10 +4217,10 @@ static void close_output (void)
    an output directory has been specified with the -O option, remove
    the directory part of INP_FNAME and use output_dir instead. */
 
-static void make_out_fname (const char *dst_fname, const char *inp_fname,
+void make_out_fname (const char *dst_fname, const char *inp_fname,
                             const char *ext)
 {
-  static char tmp1[MAXPATHLEN+3];
+  char tmp1[MAXPATHLEN+3];
   char tmp2[MAXPATHLEN+3];
 
   if (dst_fname == NULL)
@@ -3839,7 +4245,7 @@ static void make_out_fname (const char *dst_fname, const char *inp_fname,
 /* Read the header of an archive member at file position POS.  Return
    FALSE when reaching the end of the file. */
 
-static int ar_read_header (struct ar_hdr *dst, long pos)
+int ar_read_header (struct ar_hdr *dst, long pos)
 {
   int size, i;
 
@@ -3862,7 +4268,7 @@ static int ar_read_header (struct ar_hdr *dst, long pos)
 
 /* Retrieve the size from the header of an archive member. */
 
-static long ar_member_size (const struct ar_hdr *p)
+long ar_member_size (const struct ar_hdr *p)
 {
   long size;
   char *e;
@@ -3879,12 +4285,12 @@ static long ar_member_size (const struct ar_hdr *p)
    If DST_FNAME is NULL, the output file name is derived from
    SRC_FNAME. */
 
-static void convert (const char *src_fname, const char *dst_fname)
+void convert (const char *src_fname, const char *dst_fname)
 {
   char tmp1[MAXPATHLEN+3], tmp2[MAXPATHLEN+3];
   char *p = NULL, *name, *end;
   long size, index;
-  static char ar_magic[SARMAG+1] = ARMAG;
+  char ar_magic[SARMAG+1] = ARMAG;
   char ar_test[SARMAG];
   struct ar_hdr ar;
   long ar_pos;
@@ -4124,7 +4530,7 @@ static void convert (const char *src_fname, const char *dst_fname)
 /* Delete all the files stored in the FILES_TO_DELETE list.  While
    deleting the files, the list elements are deallocated. */
 
-static void delete_files (void)
+void delete_files (void)
 {
   struct delete *p, *q;
 
@@ -4150,7 +4556,7 @@ int main (int argc, char *argv[])
   /* Keep emxomf in memory for the number of minutes indicated by the
      GCCLOAD environment variable. */
 
-  _emxload_env ("GCCLOAD");
+//  _emxload_env ("GCCLOAD");
 
   /* Get options from the EMXOMFOPT environment variable, expand
      response files (@filename) and wildcard (*.o) on the command

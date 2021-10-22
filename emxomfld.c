@@ -23,7 +23,7 @@ Boston, MA 02111-1307, USA.  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <alloca.h>
+//#include <alloca.h>
 #include <errno.h>
 #include <string.h>
 #include <process.h>
@@ -32,15 +32,44 @@ Boston, MA 02111-1307, USA.  */
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/utime.h>
-#include <sys/moddef.h>
+//#include <sys/moddef.h>
 #include <getopt.h>
-#include <alloca.h>
+//#include <alloca.h>
+#include <time.h>
+#include <windows.h>
+
+
+#define FALSE 0
+#define TRUE  1
+
+////////////////////
+/* omflib0.h (emx+gcc) -- Copyright (c) 1993-1996 by Eberhard Mattes */
+
+/* Private header file for the emx OMFLIB library. */
+
+#ifndef _BYTE_WORD_DWORD
+#define _BYTE_WORD_DWORD
+typedef unsigned char byte;
+typedef unsigned short word;
+typedef unsigned long dword;
+#endif /* _BYTE_WORD_DWORD */
+
+
+struct timezone 
+{
+  int  tz_minuteswest; /* minutes W of Greenwich */
+  int  tz_dsttime;     /* type of dst correction */
+};
+
+int gettimeofday(struct timeval *tv, struct timezone *tz);
+
+
+////////////////////////////////
+
 #include <sys/omflib.h>
 #include "defs.h"
 #include "weakld.h"
 
-#define FALSE 0
-#define TRUE  1
 
 /* A member of a linked list of strings such as file names. */
 typedef struct name_list
@@ -1282,6 +1311,9 @@ static void gen_deffile(void)
 }
 
 /* converts a def file statement to watcom responsfile lingo. */
+#include "sys/moddef.h"
+#define VERSION         "0.9d"
+#define INNOTEK_VERSION         "0.9d"
 
 static int def_2_watcom(struct _md *md, const _md_stmt *stmt, _md_token token, void *arg)
 {

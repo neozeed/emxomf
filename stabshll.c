@@ -30,10 +30,10 @@ Boston, MA 02111-1307, USA.  */
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
-#include <alloca.h>
+//#include <alloca.h>
 #include <ctype.h>
 #ifdef DEMANGLE_PROC_NAMES
-# include <demangle.h>
+# include "demangle.h"
 #endif
 #include "defs.h"
 #include "emxomf.h"
